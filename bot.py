@@ -103,6 +103,9 @@ def init_db():
         con.execute("ALTER TABLE settings ADD COLUMN smart_pause_min INTEGER NOT NULL DEFAULT 10")
     if "reset_hours" not in cols_settings:
         con.execute("ALTER TABLE settings ADD COLUMN reset_hours INTEGER NOT NULL DEFAULT 24")
+    if "prompt_mode" not in cols_settings:
+        con.execute("ALTER TABLE settings ADD COLUMN prompt_mode TEXT NOT NULL DEFAULT 'system'")
+    con.execute("UPDATE settings SET prompt=? WHERE owner_id=? AND TRIM(prompt)=''", (DEFAULT_PROMPT, OWNER_ID))
 
     cols_counts = [r["name"] for r in con.execute("PRAGMA table_info(reply_counts)").fetchall()]
     if "last_reply_time" not in cols_counts:
@@ -143,6 +146,7 @@ def set_setting(key, value):
         "offline_delay_min",
         "smart_pause_min",
         "reset_hours",
+        "prompt_mode",
     }
     if key not in allowed:
         raise ValueError(key)
@@ -494,7 +498,7 @@ async def check_api_ui(call: CallbackQuery):
         return
 
     await call.answer("Проверяю API...")
-    ok, msg = await test_api(s["api_url"], key, s["model"])
+    ok, msg = await test_api(s["api_url"], key, s["model"], effective_prompt(s), s.get("prompt_mode") or "system")
     res_text = f"✅ <b>API работает отлично!</b>\nОтвет: {esc(msg)}" if ok else f"❌ <b>Ошибка API:</b>\n{esc(msg)}"
     await call.message.answer(res_text, parse_mode="HTML")
 
@@ -565,9 +569,19 @@ async def change_prompt(call: CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return
     s = get_settings()
-    text = f"✏️ <b>Системный промпт:</b>\n\n<code>{esc(s['prompt'])}</code>"
+    merge = (s.get("prompt_mode") or "system") == "merge"
+    mode_txt = "внутри сообщения (усиленный)" if merge else "system-роль (стандартный)"
+    text = (
+        f"✏️ <b>Системный промпт:</b>\n\n<code>{esc(effective_prompt(s))}</code>\n\n"
+        f"Способ передачи: <b>{mode_txt}</b>\n"
+        "<i>💡 Если после смены API/модели ИИ игнорирует промпт — включи усиленный режим.</i>"
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Изменить промпт", callback_data="prompt_edit")],
+        [InlineKeyboardButton(
+            text="🔁 Режим: усиленный" if merge else "🔁 Режим: стандартный",
+            callback_data="prompt_mode_toggle",
+        )],
         [InlineKeyboardButton(text="🔄 Сбросить на стандартный", callback_data="prompt_reset")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="page_reply")],
     ])
@@ -581,6 +595,17 @@ async def edit_prompt_ui(call: CallbackQuery):
     pending[call.from_user.id] = "prompt"
     await call.message.answer("✏️ <b>Отправь новый системный промпт:</b>", parse_mode="HTML")
     await call.answer()
+
+
+@dp.callback_query(F.data == "prompt_mode_toggle")
+async def toggle_prompt_mode(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID:
+        return
+    s = get_settings()
+    new_mode = "system" if (s.get("prompt_mode") or "system") == "merge" else "merge"
+    set_setting("prompt_mode", new_mode)
+    await call.answer("Режим промпта изменён")
+    await change_prompt(call)
 
 
 @dp.callback_query(F.data == "prompt_reset")
@@ -721,6 +746,10 @@ async def handle_private_message(message: Message):
                 return
 
             if action == "prompt":
+                if not val:
+                    await message.answer("❌ Промпт не может быть пустым. Отправь текст промпта.")
+                    pending[message.from_user.id] = "prompt"
+                    return
                 set_setting("prompt", val)
                 await message.answer("✏️ <b>Системный промпт сохранён!</b>", parse_mode="HTML")
                 await message.answer(main_text(), parse_mode="HTML", reply_markup=keyboard_main())
@@ -813,31 +842,99 @@ async def should_suppress_due_to_online() -> tuple[bool, str]:
     return False, "Проверка завершена"
 
 
-async def test_api(api_url: str, api_key: str, model: str):
-    url = api_url.rstrip("/")
+def chat_url(api_url: str) -> str:
+    url = (api_url or "").strip().rstrip("/")
     if not url.endswith("/chat/completions"):
         url += "/chat/completions"
+    return url
 
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 10,
-    }
+
+def effective_prompt(s: dict) -> str:
+    return (s.get("prompt") or "").strip() or DEFAULT_PROMPT
+
+
+def build_messages(prompt: str, text: str, mode: str):
+    if mode == "merge":
+        # Some providers/models drop or weakly follow the system role:
+        # put the instructions directly into the user turn as well.
+        return [{
+            "role": "user",
+            "content": (
+                f"Инструкция (строго следуй ей):\n{prompt}\n\n"
+                f"Сообщение собеседника:\n{text}"
+            ),
+        }]
+    return [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": text},
+    ]
+
+
+def system_role_rejected(status: int, body: str) -> bool:
+    if status not in (400, 422):
+        return False
+    b = body.lower()
+    return any(k in b for k in ("system", "developer instruction", "role"))
+
+
+THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
+
+
+def extract_content(data: dict) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    content = (choices[0].get("message") or {}).get("content") or ""
+    if isinstance(content, list):
+        content = "".join(
+            item.get("text", "") for item in content if isinstance(item, dict)
+        )
+    # Reasoning models (DeepSeek R1, Qwen etc.) may return their chain of thought.
+    content = THINK_RE.sub("", str(content))
+    if "</think>" in content:
+        content = content.split("</think>", 1)[1]
+    return content.strip()
+
+
+async def chat_request(api_url: str, api_key: str, model: str, prompt: str, text: str,
+                       mode: str = "system", max_tokens: Optional[int] = None, timeout_s: int = 60):
+    """Returns (status, body, used_mode). Falls back to merge mode if the system role is rejected."""
+    url = chat_url(api_url)
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
-    try:
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        modes = [mode] if mode == "merge" else [mode, "merge"]
+        status, body = 0, ""
+        for m in modes:
+            payload = {"model": model, "messages": build_messages(prompt, text, m)}
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
             async with session.post(url, json=payload, headers=headers) as r:
-                body = await r.text()
-                if r.status >= 400:
-                    return False, f"HTTP {r.status}: {body[:300]}"
-                data = json.loads(body)
-                if not data.get("choices"):
-                    return False, "API ответил без choices."
-                return True, data["choices"][0].get("message", {}).get("content", "OK")
+                status, body = r.status, await r.text()
+            if m == "system" and system_role_rejected(status, body):
+                print(f"Provider rejected system role, retrying with prompt in user message: {body[:200]}")
+                continue
+            return status, body, m
+        return status, body, modes[-1]
+
+
+async def test_api(api_url: str, api_key: str, model: str, prompt: str = DEFAULT_PROMPT, mode: str = "system"):
+    try:
+        status, body, used = await chat_request(
+            api_url, api_key, model, prompt, "Привет! Ты кто?", mode, max_tokens=200, timeout_s=30
+        )
+        if status >= 400:
+            return False, f"HTTP {status}: {body[:300]}"
+        data = json.loads(body)
+        if not data.get("choices"):
+            return False, "API ответил без choices."
+        answer = extract_content(data) or "(пустой ответ)"
+        if used != mode:
+            answer += "\n\n⚠️ Провайдер не принимает system-роль — промпт передаётся внутри сообщения."
+        return True, answer
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
@@ -848,38 +945,16 @@ async def ask_ai(text: str):
     if not key:
         return "Здравствуйте! Владелец сейчас не в сети и ответит вам позже."
 
-    url = s["api_url"].rstrip("/")
-    if not url.endswith("/chat/completions"):
-        url += "/chat/completions"
-
-    payload = {
-        "model": s["model"],
-        "messages": [
-            {"role": "system", "content": s["prompt"]},
-            {"role": "user", "content": text},
-        ],
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {key}",
-    }
-
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json=payload, headers=headers) as r:
-            body = await r.text()
-            if r.status >= 400:
-                raise RuntimeError(f"HTTP {r.status}: {body[:300]}")
-            data = json.loads(body)
-            choices = data.get("choices", [])
-            if not choices:
-                return ""
-            content = choices[0].get("message", {}).get("content", "")
-            if isinstance(content, list):
-                return "".join(
-                    item.get("text", "") for item in content if isinstance(item, dict)
-                )
-            return str(content or "").strip()
+    mode = s.get("prompt_mode") or "system"
+    status, body, used = await chat_request(
+        s["api_url"], key, s["model"], effective_prompt(s), text, mode
+    )
+    if status >= 400:
+        raise RuntimeError(f"HTTP {status}: {body[:300]}")
+    if used != mode:
+        # Remember that this provider needs the prompt inside the user message.
+        set_setting("prompt_mode", used)
+    return extract_content(json.loads(body))
 
 
 # Telegram Business / Chat Automation
