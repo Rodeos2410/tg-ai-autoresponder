@@ -1,0 +1,4 @@
+aiogram>=3.22,<4
+aiohttp>=3.10,<4
+cryptography>=43,<47
+python-dotenv>=1.0,<2
