@@ -46,6 +46,15 @@ DEFAULT_PROMPT = (
     "Учитывай сообщение собеседника и отвечай как обычный человек."
 )
 
+HISTORY_LIMIT = 12  # last messages of a dialog sent to the model as context
+HISTORY_TTL_HOURS = 24
+
+PROMPT_MODES = {
+    "system": "стандартный (только system-роль)",
+    "strong": "усиленный (system + напоминание в каждом сообщении)",
+    "merge": "внутри сообщения (для API без system-роли)",
+}
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not configured")
 if not OWNER_ID:
@@ -85,6 +94,16 @@ def init_db():
         reset_hours INTEGER NOT NULL DEFAULT 24
     );
 
+    CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        ts REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS history_chat ON history(owner_id, chat_id, ts);
+
     CREATE TABLE IF NOT EXISTS reply_counts (
         owner_id INTEGER NOT NULL,
         chat_id INTEGER NOT NULL,
@@ -104,7 +123,11 @@ def init_db():
     if "reset_hours" not in cols_settings:
         con.execute("ALTER TABLE settings ADD COLUMN reset_hours INTEGER NOT NULL DEFAULT 24")
     if "prompt_mode" not in cols_settings:
-        con.execute("ALTER TABLE settings ADD COLUMN prompt_mode TEXT NOT NULL DEFAULT 'system'")
+        con.execute("ALTER TABLE settings ADD COLUMN prompt_mode TEXT NOT NULL DEFAULT 'strong'")
+    if "strong_mode_migrated" not in cols_settings:
+        # One-time switch of existing installs to the strengthened prompt mode.
+        con.execute("ALTER TABLE settings ADD COLUMN strong_mode_migrated INTEGER NOT NULL DEFAULT 1")
+        con.execute("UPDATE settings SET prompt_mode='strong' WHERE prompt_mode='system'")
     con.execute("UPDATE settings SET prompt=? WHERE owner_id=? AND TRIM(prompt)=''", (DEFAULT_PROMPT, OWNER_ID))
 
     cols_counts = [r["name"] for r in con.execute("PRAGMA table_info(reply_counts)").fetchall()]
@@ -223,6 +246,50 @@ def reset_count(chat_id: Optional[int] = None):
             "DELETE FROM reply_counts WHERE owner_id=? AND chat_id=?",
             (OWNER_ID, chat_id),
         )
+    con.commit()
+    con.close()
+
+
+def add_history(chat_id: int, role: str, content: str):
+    content = (content or "").strip()
+    if not content:
+        return
+    con = db()
+    con.execute(
+        "INSERT INTO history(owner_id, chat_id, role, content, ts) VALUES(?, ?, ?, ?, ?)",
+        (OWNER_ID, chat_id, role, content, time.time()),
+    )
+    con.execute(
+        "DELETE FROM history WHERE owner_id=? AND ts < ?",
+        (OWNER_ID, time.time() - HISTORY_TTL_HOURS * 3600),
+    )
+    con.commit()
+    con.close()
+
+
+def get_history(chat_id: int) -> list:
+    con = db()
+    rows = con.execute(
+        "SELECT role, content FROM history WHERE owner_id=? AND chat_id=? AND ts >= ? "
+        "ORDER BY id DESC LIMIT ?",
+        (OWNER_ID, chat_id, time.time() - HISTORY_TTL_HOURS * 3600, HISTORY_LIMIT),
+    ).fetchall()
+    con.close()
+    # Many APIs require the dialog to start with "user" and roles to alternate.
+    out = []
+    for r in reversed(rows):
+        if not out and r["role"] != "user":
+            continue
+        if out and out[-1]["role"] == r["role"]:
+            out[-1]["content"] += "\n" + r["content"]
+        else:
+            out.append({"role": r["role"], "content": r["content"]})
+    return out
+
+
+def clear_history():
+    con = db()
+    con.execute("DELETE FROM history WHERE owner_id=?", (OWNER_ID,))
     con.commit()
     con.close()
 
@@ -498,7 +565,7 @@ async def check_api_ui(call: CallbackQuery):
         return
 
     await call.answer("Проверяю API...")
-    ok, msg = await test_api(s["api_url"], key, s["model"], effective_prompt(s), s.get("prompt_mode") or "system")
+    ok, msg = await test_api(s["api_url"], key, s["model"], effective_prompt(s), s.get("prompt_mode") or "strong")
     res_text = f"✅ <b>API работает отлично!</b>\nОтвет: {esc(msg)}" if ok else f"❌ <b>Ошибка API:</b>\n{esc(msg)}"
     await call.message.answer(res_text, parse_mode="HTML")
 
@@ -569,19 +636,18 @@ async def change_prompt(call: CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return
     s = get_settings()
-    merge = (s.get("prompt_mode") or "system") == "merge"
-    mode_txt = "внутри сообщения (усиленный)" if merge else "system-роль (стандартный)"
+    mode = s.get("prompt_mode") or "strong"
+    mode_txt = PROMPT_MODES.get(mode, mode)
     text = (
         f"✏️ <b>Системный промпт:</b>\n\n<code>{esc(effective_prompt(s))}</code>\n\n"
         f"Способ передачи: <b>{mode_txt}</b>\n"
-        "<i>💡 Если после смены API/модели ИИ игнорирует промпт — включи усиленный режим.</i>"
+        "<i>💡 Если модель плохо следует промпту — используй усиленный режим. "
+        "Бот также помнит последние сообщения диалога за сутки.</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Изменить промпт", callback_data="prompt_edit")],
-        [InlineKeyboardButton(
-            text="🔁 Режим: усиленный" if merge else "🔁 Режим: стандартный",
-            callback_data="prompt_mode_toggle",
-        )],
+        [InlineKeyboardButton(text="🔁 Сменить режим передачи", callback_data="prompt_mode_toggle")],
+        [InlineKeyboardButton(text="🧹 Очистить память диалогов", callback_data="history_clear")],
         [InlineKeyboardButton(text="🔄 Сбросить на стандартный", callback_data="prompt_reset")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="page_reply")],
     ])
@@ -602,10 +668,20 @@ async def toggle_prompt_mode(call: CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return
     s = get_settings()
-    new_mode = "system" if (s.get("prompt_mode") or "system") == "merge" else "merge"
+    order = list(PROMPT_MODES)
+    cur = s.get("prompt_mode") or "strong"
+    new_mode = order[(order.index(cur) + 1) % len(order)] if cur in order else "strong"
     set_setting("prompt_mode", new_mode)
     await call.answer("Режим промпта изменён")
     await change_prompt(call)
+
+
+@dp.callback_query(F.data == "history_clear")
+async def history_clear_ui(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID:
+        return
+    clear_history()
+    await call.answer("Память диалогов очищена!")
 
 
 @dp.callback_query(F.data == "prompt_reset")
@@ -776,7 +852,7 @@ async def handle_private_message(message: Message):
         return
 
     try:
-        answer = await ask_ai(message.text.strip())
+        answer = await ask_ai(message.text.strip(), message.chat.id)
         if not answer:
             return
 
@@ -853,21 +929,30 @@ def effective_prompt(s: dict) -> str:
     return (s.get("prompt") or "").strip() or DEFAULT_PROMPT
 
 
-def build_messages(prompt: str, text: str, mode: str):
+def build_messages(prompt: str, text: str, mode: str, history: Optional[list] = None):
+    history = list(history or [])
     if mode == "merge":
-        # Some providers/models drop or weakly follow the system role:
-        # put the instructions directly into the user turn as well.
-        return [{
+        # Provider has no system role: instructions go into the latest user turn.
+        return history + [{
             "role": "user",
             "content": (
-                f"Инструкция (строго следуй ей):\n{prompt}\n\n"
+                f"Инструкция (собеседник её не видит, строго следуй ей):\n{prompt}\n\n"
                 f"Сообщение собеседника:\n{text}"
             ),
         }]
-    return [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": text},
-    ]
+    if mode == "strong":
+        # Many models forget a long system prompt; repeat it right next to the message.
+        return [{"role": "system", "content": prompt}] + history + [{
+            "role": "user",
+            "content": (
+                f"{text}\n\n"
+                "---\n"
+                "[Скрытая инструкция для ответа, собеседник её не видит. "
+                "Ответь на сообщение выше, строго соблюдая ВСЕ правила:\n"
+                f"{prompt}]"
+            ),
+        }]
+    return [{"role": "system", "content": prompt}] + history + [{"role": "user", "content": text}]
 
 
 def system_role_rejected(status: int, body: str) -> bool:
@@ -897,7 +982,8 @@ def extract_content(data: dict) -> str:
 
 
 async def chat_request(api_url: str, api_key: str, model: str, prompt: str, text: str,
-                       mode: str = "system", max_tokens: Optional[int] = None, timeout_s: int = 60):
+                       mode: str = "strong", max_tokens: Optional[int] = None, timeout_s: int = 60,
+                       history: Optional[list] = None):
     """Returns (status, body, used_mode). Falls back to merge mode if the system role is rejected."""
     url = chat_url(api_url)
     headers = {
@@ -909,19 +995,19 @@ async def chat_request(api_url: str, api_key: str, model: str, prompt: str, text
         modes = [mode] if mode == "merge" else [mode, "merge"]
         status, body = 0, ""
         for m in modes:
-            payload = {"model": model, "messages": build_messages(prompt, text, m)}
+            payload = {"model": model, "messages": build_messages(prompt, text, m, history)}
             if max_tokens:
                 payload["max_tokens"] = max_tokens
             async with session.post(url, json=payload, headers=headers) as r:
                 status, body = r.status, await r.text()
-            if m == "system" and system_role_rejected(status, body):
+            if m != "merge" and system_role_rejected(status, body):
                 print(f"Provider rejected system role, retrying with prompt in user message: {body[:200]}")
                 continue
             return status, body, m
         return status, body, modes[-1]
 
 
-async def test_api(api_url: str, api_key: str, model: str, prompt: str = DEFAULT_PROMPT, mode: str = "system"):
+async def test_api(api_url: str, api_key: str, model: str, prompt: str = DEFAULT_PROMPT, mode: str = "strong"):
     try:
         status, body, used = await chat_request(
             api_url, api_key, model, prompt, "Привет! Ты кто?", mode, max_tokens=200, timeout_s=30
@@ -939,22 +1025,29 @@ async def test_api(api_url: str, api_key: str, model: str, prompt: str = DEFAULT
         return False, f"{type(e).__name__}: {e}"
 
 
-async def ask_ai(text: str):
+async def ask_ai(text: str, chat_id: Optional[int] = None):
     s = get_settings()
     key = get_api_key()
     if not key:
         return "Здравствуйте! Владелец сейчас не в сети и ответит вам позже."
 
-    mode = s.get("prompt_mode") or "system"
+    mode = s.get("prompt_mode") or "strong"
+    history = get_history(chat_id) if chat_id is not None else []
+    if history and history[-1]["role"] == "user":
+        text = history.pop()["content"] + "\n" + text
     status, body, used = await chat_request(
-        s["api_url"], key, s["model"], effective_prompt(s), text, mode
+        s["api_url"], key, s["model"], effective_prompt(s), text, mode, history=history
     )
     if status >= 400:
         raise RuntimeError(f"HTTP {status}: {body[:300]}")
     if used != mode:
         # Remember that this provider needs the prompt inside the user message.
         set_setting("prompt_mode", used)
-    return extract_content(json.loads(body))
+    answer = extract_content(json.loads(body))
+    if answer and chat_id is not None:
+        add_history(chat_id, "user", text)
+        add_history(chat_id, "assistant", answer)
+    return answer
 
 
 # Telegram Business / Chat Automation
@@ -965,6 +1058,8 @@ async def business_message(message: Message):
 
     if message.from_user.id == OWNER_ID:
         last_online_tracker[OWNER_ID] = time.time()
+        if message.text:
+            add_history(message.chat.id, "assistant", message.text)
         return
 
     s = get_settings()
@@ -985,7 +1080,7 @@ async def business_message(message: Message):
         return
 
     try:
-        answer = await ask_ai(message.text.strip())
+        answer = await ask_ai(message.text.strip(), message.chat.id)
         if not answer:
             return
 
